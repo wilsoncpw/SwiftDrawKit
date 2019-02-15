@@ -15,10 +15,16 @@ public extension NSBezierPath {
     }
     
     static let kDKTextOnPathChecksumCacheKey = "DKTextOnPathChecksum"
+    static let kDKTextOnPathGlyphPositionsCacheKey = "DKTextOnPathGlyphPositions"
+    static let kDKTextOnPathTextFittedCacheKey = "DKTextOnPathTextFitted"
     static var topLayoutMgr: NSLayoutManager?
     
     typealias AttributesDictionary = [NSAttributedString.Key: Any]
-    public typealias ChecksumCache = [String: Int]
+    
+    public class Cache {
+        var cache = [String: Any] ()
+        public init () {}
+    }
 
 
     static var textOnPathLayoutManager : NSLayoutManager {
@@ -69,13 +75,14 @@ public extension NSBezierPath {
         return (try? drawTextOnPath(str, yOffset: dy, layoutManager: nil, cache: nil)) ?? false
     }
     
-    public func drawTextOnPath (_ str: NSAttributedString, yOffset dy: CGFloat, layoutManager lm: NSLayoutManager?, cache: UnsafeMutablePointer<ChecksumCache>?) throws -> Bool {
+    public func drawTextOnPath (_ str: NSAttributedString, yOffset dy: CGFloat, layoutManager lm: NSLayoutManager?, cache: Cache?) throws -> Bool {
         
-        if let cachep = cache {
-            var cache = cachep.pointee
-            if cache [NSBezierPath.kDKTextOnPathChecksumCacheKey] != hashValue {
-                cache.removeAll()
-                cache [NSBezierPath.kDKTextOnPathChecksumCacheKey] = hashValue
+        if let cache = cache {
+            let hv = checksum
+            let cs = cache.cache [NSBezierPath.kDKTextOnPathChecksumCacheKey] as? Int
+            if cs != hv {
+                cache.cache.removeAll()
+                cache.cache [NSBezierPath.kDKTextOnPathChecksumCacheKey] = hv
             }
             
         }
@@ -87,7 +94,14 @@ public extension NSBezierPath {
         
         drawUnderlinePathForLayoutManager (layoutManager, yOffset: dy, cache: cache)
         
-        return false
+        text.removeAttribute(.underlineStyle, range: NSMakeRange(0, text.length))
+        text.removeAttribute(.strikethroughStyle, range: NSMakeRange(0, text.length))
+        
+        let glyphDrawer = DKTextOnPathGlyphDrawer ()
+        
+        let rv = layoutStringOnPath (text, yOffset:dy, usingLayoutHelper:glyphDrawer, layoutManager:layoutManager, cache: cache)
+        
+        return rv
     }
     
     func preadjustedTextStorageWithString (_ str: NSAttributedString, layoutManager lm: NSLayoutManager) throws -> NSTextStorage {
@@ -142,7 +156,7 @@ public extension NSBezierPath {
         text.addAttributes(kernAttributes, range: charRange)
     }
     
-    func drawUnderlinePathForLayoutManager (_ lm: NSLayoutManager, yOffset dy: CGFloat, cache: UnsafeMutablePointer<ChecksumCache>?) {
+    func drawUnderlinePathForLayoutManager (_ lm: NSLayoutManager, yOffset dy: CGFloat, cache: Cache?) {
         guard let textStorage = lm.textStorage else {
             return
         }
@@ -159,7 +173,7 @@ public extension NSBezierPath {
         }
     }
 
-    func drawUnderlinePathForLayoutManager (_ lm: NSLayoutManager, range: NSRange, yOffset dy: CGFloat, cache: UnsafeMutablePointer<ChecksumCache>?) {
+    func drawUnderlinePathForLayoutManager (_ lm: NSLayoutManager, range: NSRange, yOffset dy: CGFloat, cache: Cache?) {
         
         guard let str = lm.textStorage else {
             return
@@ -178,8 +192,7 @@ public extension NSBezierPath {
         let pathKey = String (format: "DKUnderlinePath_%@_%.2f", NSStringFromRange(range), dy)
 
         if let cachep = cache {
-            let cache = cachep.pointee
-            ulp = cache [pathKey] as? NSBezierPath
+            ulp = cachep.cache [pathKey] as? NSBezierPath
         }
         
         if ulp == nil {
@@ -219,5 +232,154 @@ public extension NSBezierPath {
         shad?.set()
         ulc?.set()
         ulp?.stroke()
+    }
+    
+    internal func layoutStringOnPath (_ str: NSTextStorage, yOffset dy:CGFloat, usingLayoutHelper helperObject: DKTextOnPathPlacement, layoutManager lm: NSLayoutManager, cache: Cache?) -> Bool {
+        
+        let NINETY_DEGREES = CGFloat.pi/2
+
+        if elementCount < 2 || str.length < 1 {
+            return false
+        }
+        
+        let para = str.attributes(at: 0, effectiveRange: nil) [.paragraphStyle] as? NSMutableParagraphStyle
+        para?.lineBreakMode = .byClipping
+        
+        if let para = para {
+            let attrs = [NSAttributedString.Key.paragraphStyle:para]
+            str.addAttributes(attrs, range: NSMakeRange (0, str.length))
+        }
+        
+        let tc = lm.textContainers.last!
+        var temp: NSBezierPath!
+//        var glyphIndex = 0
+        var gbr = NSRect (origin: NSZeroPoint, size: tc.containerSize)
+        var result = true
+        
+        let glyphRange = lm.glyphRange(forBoundingRect: gbr, in: tc)
+        
+        var glyphCache: [DKPathGlyphInfo]?
+        var resultCache: Bool?
+        
+        if let cachep = cache {
+            glyphCache = cachep.cache [NSBezierPath.kDKTextOnPathGlyphPositionsCacheKey] as? [DKPathGlyphInfo]
+            resultCache = cachep.cache [NSBezierPath.kDKTextOnPathTextFittedCacheKey] as? Bool
+        }
+        
+        if glyphCache == nil {
+            var newGlyphCache = [DKPathGlyphInfo] ()
+            var posInfo: DKPathGlyphInfo?
+            var baseLine = CGFloat (0)
+            
+            for glyphIndex in glyphRange.location ..< NSMaxRange(glyphRange) {
+                let lineFragmentRect = lm.lineFragmentRect(forGlyphAt: glyphIndex, effectiveRange: nil)
+                let layoutLocation = lm.location(forGlyphAt: glyphIndex)
+                var viewLocation = layoutLocation
+                
+                if lineFragmentRect.origin.y > 0 {
+                    result = false
+                    break
+                }
+                
+                gbr = lm.boundingRect(forGlyphRange: NSMakeRange(glyphIndex, 1), in: tc)
+                let half = gbr.width * 0.5
+                
+                if half > 0 {
+                    temp = bezierPathByTrimmingFromLength (NSMinX(lineFragmentRect) + layoutLocation.x + half)
+                    
+                    if temp.length < half {
+                        result = false
+                        break
+                    }
+                    temp.element(at: 0, associatedPoints: &viewLocation)
+                    let angle = temp.slopeStartingPath
+                    
+                    baseLine = NSHeight (gbr) - lm.typesetter.baselineOffset(in: lm, glyphIndex: glyphIndex)
+                    
+                    viewLocation.x -= baseLine * cos (angle + NINETY_DEGREES)
+                    viewLocation.y -= baseLine * sin (angle + NINETY_DEGREES)
+                    
+                    viewLocation.x -= half * cos (angle)
+                    viewLocation.y -= half * sin (angle)
+                    
+                    posInfo = DKPathGlyphInfo (glyphIndex: glyphIndex, slope: angle, point: viewLocation)
+                    newGlyphCache.append(posInfo!)
+                    
+                    helperObject.layoutManager(lm: lm, willPlaceGlyphAtIndex: glyphIndex, atLocation: viewLocation, pathAngle: angle, uOffset: dy)
+                }
+            }
+            
+            if let cachep = cache {
+                cachep.cache [NSBezierPath.kDKTextOnPathGlyphPositionsCacheKey] = newGlyphCache
+                cachep.cache [NSBezierPath.kDKTextOnPathTextFittedCacheKey] = result
+            }
+        } else {
+            for info in glyphCache! {
+                helperObject.layoutManager(lm: lm, willPlaceGlyphAtIndex: info.glyphIndex, atLocation: info.point, pathAngle: info.slope, uOffset: dy)
+            }
+            result = resultCache ?? false
+        }
+        return result
+    }
+}
+
+protocol DKTextOnPathPlacement {
+    func layoutManager (lm: NSLayoutManager, willPlaceGlyphAtIndex glyphIndex:Int, atLocation location: NSPoint, pathAngle angle: CGFloat, uOffset dy: CGFloat)
+
+}
+
+class DKTextOnPathGlyphDrawer: DKTextOnPathPlacement {
+    func layoutManager (lm: NSLayoutManager, willPlaceGlyphAtIndex glyphIdx:Int, atLocation location: NSPoint, pathAngle angle: CGFloat, uOffset dy: CGFloat) {
+        NSGraphicsContext.current?.saveGraphicsState()
+        defer {
+            NSGraphicsContext.current?.restoreGraphicsState()
+        }
+        
+        let gp = lm.location(forGlyphAt: glyphIdx)
+        let transform = NSAffineTransform ()
+        
+        transform.translateX(by: location.x, yBy: location.y)
+        transform.rotate(byRadians: angle)
+        transform.concat()
+        
+        lm.drawBackground(forGlyphRange: NSMakeRange (glyphIdx, 1), at: NSMakePoint(-gp.x, 0-dy))
+        lm.drawGlyphs(forGlyphRange: NSRange (location: glyphIdx, length: 1), at: NSPoint (x: -gp.x, y: 0-dy))
+    }
+}
+
+class DKTextOnPathMetricsHelper: DKTextOnPathPlacement {
+    
+    var mCharacterRange = NSRange (location: 0, length: 0)
+    var mLength = CGFloat (0)
+    var mStartPosition = CGFloat (0)
+    
+    func layoutManager (lm: NSLayoutManager, willPlaceGlyphAtIndex glyphIdx:Int, atLocation location: NSPoint, pathAngle angle: CGFloat, uOffset dy: CGFloat) {
+        var glyphIndex = glyphIdx
+        let charIndex = lm.characterIndexForGlyph(at: glyphIndex)
+        
+        if NSLocationInRange(charIndex, mCharacterRange) {
+            if mLength == 0 {
+                mStartPosition =  lm.location(forGlyphAt: glyphIndex).x
+                
+                glyphIndex += 1
+                if lm.isValidGlyphIndex(glyphIndex) {
+                    mLength = lm.location(forGlyphAt: glyphIndex).x - mStartPosition
+                } else {
+                    mLength = NSMaxX(lm.lineFragmentUsedRect(forGlyphAt: glyphIndex-1, effectiveRange: nil)) - mStartPosition
+                }
+            }
+        }
+    }
+}
+
+class DKPathGlyphInfo {
+    let glyphIndex: Int
+    let slope: CGFloat
+    let point: CGPoint
+    
+    init (glyphIndex: Int, slope: CGFloat, point: CGPoint) {
+        self.glyphIndex = glyphIndex
+        self.point = point
+        self.slope = slope
     }
 }
